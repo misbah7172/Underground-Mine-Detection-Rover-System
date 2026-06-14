@@ -1,0 +1,9 @@
+.pio/
+.vscode/
+*.o
+*.a
+*.so
+build/
+dist/
+*.pyc
+.DS_Store

@@ -1,0 +1,66 @@
+<?xml version="1.0" encoding="UTF-8" standalone="no"?>
+<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="800" viewBox="0 0 1200 800">
+  <style>
+    .box { fill:#f8fafc; stroke:#0f172a; stroke-width:1.2px }
+    .title { font: bold 16px sans-serif; fill:#0f172a }
+    .label { font: 12px sans-serif; fill:#0f172a }
+    .conn { stroke:#0b6; stroke-width:2 }
+  </style>
+
+  <!-- ESP32 core -->
+  <rect x="40" y="40" width="280" height="200" rx="8" ry="8" class="box" />
+  <text x="80" y="70" class="title">ESP32 (DevKit)</text>
+  <text x="60" y="100" class="label">I2C: MPU9250 (SDA/SCL)</text>
+  <text x="60" y="120" class="label">Serial2: GPS (RX/TX)</text>
+  <text x="60" y="140" class="label">SPI: LoRa (NSS, RST, DIO0)</text>
+  <text x="60" y="160" class="label">PWM: Motor drivers (LEDC)</text>
+  <text x="60" y="180" class="label">Analog: MQ-2 (ADC), Metal detector (digital)</text>
+
+  <!-- Motor Driver -->
+  <rect x="420" y="60" width="220" height="120" rx="6" ry="6" class="box" />
+  <text x="460" y="90" class="title">BTS7960 Motor Drivers</text>
+  <text x="460" y="115" class="label">L/R PWM, DIR pins</text>
+
+  <!-- LoRa -->
+  <rect x="420" y="220" width="220" height="100" rx="6" ry="6" class="box" />
+  <text x="480" y="250" class="title">SX1278 LoRa</text>
+  <text x="480" y="275" class="label">SPI: MOSI/MISO/SCK</text>
+
+  <!-- GPS -->
+  <rect x="40" y="260" width="280" height="80" rx="6" ry="6" class="box" />
+  <text x="120" y="295" class="title">NEO-6M GPS</text>
+  <text x="60" y="320" class="label">TX -> GPS_RX (ESP32 RX2)</text>
+
+  <!-- Ultrasonics -->
+  <rect x="40" y="360" width="280" height="80" rx="6" ry="6" class="box" />
+  <text x="120" y="395" class="title">HC-SR04 x2</text>
+  <text x="60" y="420" class="label">Trig/Echo pins -> GPIO</text>
+
+  <!-- Sensors -->
+  <rect x="40" y="460" width="280" height="120" rx="6" ry="6" class="box" />
+  <text x="100" y="490" class="title">MQ-2 / Metal Detector / DHT</text>
+  <text x="60" y="515" class="label">Analog/Digital pins -> ADC / GPIO</text>
+
+  <!-- SD Card -->
+  <rect x="420" y="340" width="220" height="80" rx="6" ry="6" class="box" />
+  <text x="480" y="375" class="title">MicroSD (SPI)</text>
+  <text x="480" y="395" class="label">CS pin defined in config.h</text>
+
+  <!-- Connections (arrows) -->
+  <line x1="320" y1="120" x2="420" y2="120" class="conn" />
+  <text x="340" y="110" class="label">PWM / DIR</text>
+
+  <line x1="320" y1="220" x2="420" y2="260" class="conn" />
+  <text x="340" y="240" class="label">SPI (LoRa)</text>
+
+  <line x1="160" y1="240" x2="160" y2="260" stroke="#06f" stroke-width="2" />
+  <text x="170" y="250" class="label">Serial2 (GPS)</text>
+
+  <line x1="180" y1="300" x2="180" y2="360" stroke="#06f" stroke-width="2" />
+  <text x="190" y="330" class="label">Ultrasonic Trig/Echo</text>
+
+  <line x1="320" y1="380" x2="420" y2="380" class="conn" />
+  <text x="340" y="370" class="label">SPI (SD Card)</text>
+
+  <text x="40" y="760" class="label">See `include/config.h` for exact pin assignments.</text>
+</svg>

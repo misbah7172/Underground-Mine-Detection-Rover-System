@@ -1,0 +1,6 @@
+streamlit>=1.36
+streamlit-autorefresh>=1.0.1
+streamlit-folium>=0.25
+folium>=0.17
+pyserial>=3.5
+pandas>=2.2
