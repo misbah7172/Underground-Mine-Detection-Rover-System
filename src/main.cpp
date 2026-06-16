@@ -1,503 +1,884 @@
 #include <Arduino.h>
+#include <ArduinoJson.h>
+#include <DHT.h>
+#include <WiFi.h>
+#include <WiFiUdp.h>
+#include <math.h>
+
 #include "config.h"
-#include "motor.h"
-#include "drive.h"
-#include "gps.h"
-#include "navigator.h"
-#if USE_IMU
-#include "imu_fusion.h"
-#endif
-#include "ultrasonic.h"
-#include "loramodule.h"
-#if USE_SD
-#include "sd_logger.h"
-#endif
-#include "metal_detector_ne555.h"
 
-// PWM channels for ESP32 LEDC
-#define CHAN_ML_A 0
-#define CHAN_ML_B 1
-#define CHAN_MR_A 2
-#define CHAN_MR_B 3
-
-// Obstacle handling thresholds (bench-safe defaults)
-static const float OBSTACLE_THRESHOLD_CM = 35.0f;
-static const unsigned long TELEMETRY_INTERVAL_MS = 500;
-static const unsigned long OBSTACLE_CHECK_INTERVAL_MS = 120;
-
-#if MOTOR_DRIVER_L298N
-Motor motorL(MOTOR_L_IN1_PIN, MOTOR_L_IN2_PIN, MOTOR_L_EN_PIN, CHAN_ML_A, true);
-Motor motorR(MOTOR_R_IN1_PIN, MOTOR_R_IN2_PIN, MOTOR_R_EN_PIN, CHAN_MR_A, true);
-#else
-Motor motorL(MOTOR_L_PWM_A, MOTOR_L_PWM_B, CHAN_ML_A, CHAN_ML_B);
-Motor motorR(MOTOR_R_PWM_A, MOTOR_R_PWM_B, CHAN_MR_A, CHAN_MR_B);
-#endif
-Drive drive(motorL, motorR);
-GPSModule gps(Serial2);
-WaypointNavigator navigator(drive);
-#if USE_IMU
-IMUFusion imu;
-#endif
-UltrasonicSensor frontUltrasonic(ULTRASONIC_FRONT_TRIG_PIN, ULTRASONIC_FRONT_ECHO_PIN);
-LoRaModule lora(LORA_SS_PIN, LORA_RST_PIN, LORA_DIO0_PIN);
-#if USE_SD
-SdLogger sdLogger;
-#endif
-MetalDetectorNE555 metalDetector;
-
-enum RoverMode {
-    MODE_IDLE,
-    MODE_AUTO,
-    MODE_MANUAL,
-    MODE_ESTOP
+struct PointCm {
+  float x;
+  float y;
 };
 
-enum AvoidancePhase {
-    AVOID_NONE,
-    AVOID_BACKUP,
-    AVOID_TURN
+enum RobotMode {
+  MODE_IDLE,
+  MODE_MANUAL,
+  MODE_MISSION,
+  MODE_ESTOP
 };
 
-RoverMode currentMode = MODE_IDLE;
-AvoidancePhase avoidPhase = AVOID_NONE;
+PointCm missionPoints[LOCAL_PATH_MAX_POINTS];
+int missionPointCount = 0;
+int missionTargetIndex = -1;
+PointCm rememberedTarget = {0.0f, 0.0f};
+bool rememberedTargetValid = false;
+int obstacleAvoidanceCount = 0;
+float lastObstacleDistanceCm = -1.0f;
+bool avoidingObstacle = false;
 
-bool imuReady = false;
+RobotMode robotMode = MODE_IDLE;
 bool missionActive = false;
-double targetLat = 0.0;
-double targetLon = 0.0;
-float targetRadiusM = 1.0f;
+bool missionAbortRequested = false;
+bool estopLatched = false;
 
-unsigned long lastTelemetryMs = 0;
-unsigned long lastObstacleCheckMs = 0;
-unsigned long avoidPhaseStartMs = 0;
-unsigned long manualUntilMs = 0;
+float poseXcm = 0.0f;
+float poseYcm = 0.0f;
+float headingDeg = LOCAL_PATH_INITIAL_HEADING_DEG;
 
-float lastDistanceCm = -1.0f;
-int avoidTurnDir = 1;
-float lastHeadingDeg = 0.0f;
-GPSData lastGps = {0.0, 0.0, 0.0, 0.0, NAN, 99.9, 0, false};
-String serialLine;
-bool metalDetectedPrevious = false; // track metal state change
+// Pending mission: path command received over UDP/serial is queued here and
+// started from loop() so executeMission() never blocks inside the receive path.
+bool pendingMission = false;
+PointCm pendingMissionPoints[LOCAL_PATH_MAX_POINTS];
+int pendingMissionPointCount = 0;
 
-static const char* modeToString(RoverMode mode) {
-    switch (mode) {
-        case MODE_AUTO: return "AUTO";
-        case MODE_MANUAL: return "MANUAL";
-        case MODE_ESTOP: return "ESTOP";
-        default: return "IDLE";
-    }
+String serialBuffer;
+unsigned long manualStopAtMs = 0;
+unsigned long lastTelemetryAtMs = 0;
+unsigned long lastDetailedTelemetryAtMs = 0;
+unsigned long lastMetalSampleAtMs = 0;
+unsigned long lastMetalAlertAtMs = 0;
+unsigned long metalPauseUntilMs = 0;   // non-zero while rover is paused for metal detection
+unsigned long lastDhtSampleAtMs = 0;
+
+long metalBaselineAdc = 0;
+int metalAdc = 0;
+int metalAdcMin = 4095;
+int metalAdcMax = 0;
+int metalAdcDrop = 0;
+bool metalDetected = false;
+bool previousMetalDetected = false;
+
+DHT dht(DHT11_DATA_PIN, DHT11);
+float dhtTemperatureC = NAN;
+float dhtHumidity = NAN;
+bool dhtOk = false;
+
+WiFiUDP cmdUdp;                        // receives commands from dashboard
+bool cmdUdpReady = false;
+
+WiFiUDP udp;
+bool wifiAlertReady = false;
+String wifiAlertHost = WIFI_ALERT_HOST;
+uint16_t wifiAlertPort = WIFI_ALERT_PORT;
+String wifiAlertSsid = "";
+
+const char* modeName() {
+  switch (robotMode) {
+    case MODE_IDLE: return "IDLE";
+    case MODE_MANUAL: return "MANUAL";
+    case MODE_MISSION: return "MISSION";
+    case MODE_ESTOP: return "ESTOP";
+    default: return "UNKNOWN";
+  }
 }
 
-bool extractFloatField(const String& json, const char* key, float& outVal) {
-    String token = String("\"") + key + "\":";
-    int start = json.indexOf(token);
-    if (start < 0) return false;
-    start += token.length();
-    while (start < json.length() && (json[start] == ' ' || json[start] == '"')) start++;
-    int end = start;
-    while (end < json.length()) {
-        char c = json[end];
-        if ((c >= '0' && c <= '9') || c == '-' || c == '+' || c == '.' || c == 'e' || c == 'E') {
-            end++;
-        } else {
-            break;
-        }
-    }
-    if (end <= start) return false;
-    outVal = json.substring(start, end).toFloat();
-    return true;
+float wrap360(float degrees) {
+  while (degrees < 0.0f) degrees += 360.0f;
+  while (degrees >= 360.0f) degrees -= 360.0f;
+  return degrees;
 }
 
-bool extractIntField(const String& json, const char* key, int& outVal) {
-    float v;
-    if (!extractFloatField(json, key, v)) return false;
-    outVal = (int)v;
-    return true;
+float normalizeDeltaDeg(float degrees) {
+  while (degrees > 180.0f) degrees -= 360.0f;
+  while (degrees < -180.0f) degrees += 360.0f;
+  return degrees;
+}
+
+void writeJsonLine(JsonDocument& doc) {
+  serializeJson(doc, Serial);
+  Serial.println();
 }
 
 void sendEvent(const char* level, const char* category, const String& message) {
-    Serial.print("{\"type\":\"event\",\"level\":\"");
-    Serial.print(level);
-    Serial.print("\",\"category\":\"");
-    Serial.print(category);
-    Serial.print("\",\"message\":\"");
-    // Basic escaping for quotes
-    String safe = message;
-    safe.replace("\"", "'");
-    Serial.print(safe);
-    Serial.print("\"");
-    if (lastGps.valid) {
-        Serial.print(",\"lat\":");
-        Serial.print(lastGps.latitude, 6);
-        Serial.print(",\"lon\":");
-        Serial.print(lastGps.longitude, 6);
-    }
-    Serial.println("}");
+  StaticJsonDocument<256> doc;
+  doc["type"] = "event";
+  doc["level"] = level;
+  doc["category"] = category;
+  doc["message"] = message;
+  writeJsonLine(doc);
 }
 
-void sendTelemetryNow() {
-    String payload = "{";
-    payload += String("\"type\":\"telemetry\",\"mode\":\"") + modeToString(currentMode) + "\"";
-    payload += String(",\"mission_active\":") + (missionActive ? "true" : "false");
-    payload += String(",\"distance_cm\":") + String(lastDistanceCm, 1);
-    payload += String(",\"heading_deg\":") + String(lastHeadingDeg, 1);
-    if (lastGps.valid) {
-        payload += String(",\"gps_lat\":") + String(lastGps.latitude, 6);
-        payload += String(",\"gps_lon\":") + String(lastGps.longitude, 6);
-        payload += String(",\"speed_kph\":") + String(lastGps.speedKph, 2);
-        payload += String(",\"satellites\":") + String(lastGps.satellites);
+void stopMotors() {
+  digitalWrite(MOTOR_IN1_PIN, LOW);
+  digitalWrite(MOTOR_IN2_PIN, LOW);
+  digitalWrite(MOTOR_IN3_PIN, LOW);
+  digitalWrite(MOTOR_IN4_PIN, LOW);
+}
+
+void setMotorChannel(int speed, int pinA, int pinB) {
+  if (speed > 10) {
+    digitalWrite(pinA, HIGH);
+    digitalWrite(pinB, LOW);
+  } else if (speed < -10) {
+    digitalWrite(pinA, LOW);
+    digitalWrite(pinB, HIGH);
+  } else {
+    digitalWrite(pinA, LOW);
+    digitalWrite(pinB, LOW);
+  }
+}
+
+void driveRaw(int leftSpeed, int rightSpeed) {
+  if (estopLatched) {
+    stopMotors();
+    return;
+  }
+
+  // ENA/ENB are jumpered HIGH, so speed magnitude is treated as an on/off threshold.
+  setMotorChannel(leftSpeed, MOTOR_IN1_PIN, MOTOR_IN2_PIN);
+  setMotorChannel(rightSpeed, MOTOR_IN3_PIN, MOTOR_IN4_PIN);
+}
+
+void updatePoseByDistance(float distanceCm) {
+  float headingRad = headingDeg * PI / 180.0f;
+  poseXcm += cosf(headingRad) * distanceCm;
+  poseYcm += sinf(headingRad) * distanceCm;
+}
+
+float readDistanceCm() {
+  digitalWrite(ULTRASONIC_TRIG_PIN, LOW);
+  delayMicroseconds(2);
+  digitalWrite(ULTRASONIC_TRIG_PIN, HIGH);
+  delayMicroseconds(10);
+  digitalWrite(ULTRASONIC_TRIG_PIN, LOW);
+
+  unsigned long durationUs = pulseIn(ULTRASONIC_ECHO_PIN, HIGH, ULTRASONIC_TIMEOUT_US);
+  if (durationUs == 0) {
+    return -1.0f;
+  }
+  return durationUs / 58.0f;
+}
+
+void sendAlert(float xCm, float yCm) {
+  StaticJsonDocument<256> doc;
+  doc["type"] = "alert";
+  doc["alert_type"] = "metal_detected";
+  doc["x_cm"] = xCm;
+  doc["y_cm"] = yCm;
+  doc["adc"] = metalAdc;
+  doc["adc_baseline"] = metalBaselineAdc;
+  doc["adc_drop"] = metalAdcDrop;
+  doc["adc_detect_min"] = METAL_ADC_DETECT_MIN;
+  doc["adc_detect_max"] = METAL_ADC_DETECT_MAX;
+  // Active-low detector: ADC near 0 is strongest metal signal; no metal is ~4095.
+  int detectSpan = max(1, METAL_ADC_DETECT_MAX - METAL_ADC_DETECT_MIN);
+  int confidenceSignal = constrain(METAL_ADC_DETECT_MAX - metalAdc, 0, detectSpan);
+  doc["confidence"] = constrain(map(confidenceSignal, 0, detectSpan, 55, 99), 55, 99);
+
+  char payload[256];
+  size_t len = serializeJson(doc, payload, sizeof(payload));
+  Serial.println(payload);
+
+  if (wifiAlertReady) {
+    udp.beginPacket(wifiAlertHost.c_str(), wifiAlertPort);
+    udp.write(reinterpret_cast<const uint8_t*>(payload), len);
+    udp.endPacket();
+  }
+}
+
+void sendTelemetry(bool detailed = false) {
+  StaticJsonDocument<1024> doc;
+  doc["type"] = "telemetry";
+  doc["mode"] = modeName();
+  doc["mission_active"] = missionActive;
+  doc["metal_detected"] = metalDetected;
+  doc["metal_adc"] = metalAdc;
+  doc["metal_adc_min"] = metalAdcMin;
+  doc["metal_adc_max"] = metalAdcMax;
+  doc["metal_adc_detect_min"] = METAL_ADC_DETECT_MIN;
+  doc["metal_adc_detect_max"] = METAL_ADC_DETECT_MAX;
+  doc["x_cm"] = poseXcm;
+  doc["y_cm"] = poseYcm;
+  doc["heading_deg"] = headingDeg;
+  doc["telemetry_detail"] = detailed;
+
+  if (detailed) {
+    doc["distance_cm"] = readDistanceCm();
+    doc["metal_baseline"] = metalBaselineAdc;
+    doc["metal_adc_drop"] = metalAdcDrop;
+    doc["mission_target_index"] = missionTargetIndex;
+    doc["mission_points"] = missionPointCount;
+    doc["remembered_target_valid"] = rememberedTargetValid;
+    if (rememberedTargetValid) {
+      doc["remembered_target_x_cm"] = rememberedTarget.x;
+      doc["remembered_target_y_cm"] = rememberedTarget.y;
     }
-    if (missionActive) {
-        payload += String(",\"target_lat\":") + String(targetLat, 6);
-        payload += String(",\"target_lon\":") + String(targetLon, 6);
-        payload += String(",\"target_radius_m\":") + String(targetRadiusM, 3);
-    }
-    // mag calibration progress (only when IMU enabled)
-#if USE_IMU
-    if (imu.isMagCalibrating()) {
-        payload += String(",\"mag_cal_active\":true");
-        payload += String(",\"mag_cal_progress\":") + String(imu.getMagCalProgress());
+    doc["avoiding_obstacle"] = avoidingObstacle;
+    doc["obstacle_count"] = obstacleAvoidanceCount;
+    doc["last_obstacle_cm"] = lastObstacleDistanceCm;
+    doc["dht11_ok"] = dhtOk;
+    if (dhtOk) {
+      doc["dht11_temperature_c"] = dhtTemperatureC;
+      doc["dht11_humidity_percent"] = dhtHumidity;
     } else {
-        payload += String(",\"mag_cal_active\":false");
+      doc["dht11_temperature_c"] = nullptr;
+      doc["dht11_humidity_percent"] = nullptr;
+    }
+    doc["wifi_alert_ready"] = wifiAlertReady;
+    doc["wifi_alert_host"] = wifiAlertHost;
+    doc["wifi_alert_port"] = wifiAlertPort;
+    if (WiFi.status() == WL_CONNECTED) {
+      doc["wifi_ip"] = WiFi.localIP().toString();
+      doc["wifi_ssid"] = WiFi.SSID();
+    } else {
+      doc["wifi_ip"] = nullptr;
+      doc["wifi_ssid"] = wifiAlertSsid;
+    }
+  }
+  char telPayload[1024];
+  size_t telLen = serializeJson(doc, telPayload, sizeof(telPayload));
+  Serial.println(telPayload);
+
+  // Also broadcast telemetry over UDP so the dashboard receives it wirelessly.
+  if (wifiAlertReady) {
+    udp.beginPacket(wifiAlertHost.c_str(), wifiAlertPort);
+    udp.write(reinterpret_cast<const uint8_t*>(telPayload), telLen);
+    udp.endPacket();
+  }
+
+  metalAdcMin = metalAdc;
+  metalAdcMax = metalAdc;
+}
+
+void sampleDht11() {
+  unsigned long now = millis();
+  if (now - lastDhtSampleAtMs < DHT11_SAMPLE_INTERVAL_MS) {
+    return;
+  }
+  lastDhtSampleAtMs = now;
+
+  float humidity = dht.readHumidity();
+  float temperatureC = dht.readTemperature();
+  if (isnan(humidity) || isnan(temperatureC)) {
+    dhtOk = false;
+    return;
+  }
+
+  dhtHumidity = humidity;
+  dhtTemperatureC = temperatureC;
+  dhtOk = true;
+}
+
+void sampleMetalDetector(bool allowMissionStop) {
+  unsigned long now = millis();
+  if (now - lastMetalSampleAtMs < METAL_SAMPLE_INTERVAL_MS) {
+    return;
+  }
+  lastMetalSampleAtMs = now;
+
+  metalAdc = analogRead(METAL_ADC_PIN);
+  if (metalAdc < metalAdcMin) metalAdcMin = metalAdc;
+  if (metalAdc > metalAdcMax) metalAdcMax = metalAdc;
+  metalAdcDrop = static_cast<int>(metalBaselineAdc - metalAdc);
+  previousMetalDetected = metalDetected;
+  metalDetected = metalAdc >= METAL_ADC_DETECT_MIN && metalAdc <= METAL_ADC_DETECT_MAX;
+
+  if (metalDetected && now - lastMetalAlertAtMs >= METAL_ALERT_COOLDOWN_MS) {
+    lastMetalAlertAtMs = now;
+    sendAlert(poseXcm, poseYcm);
+    lastTelemetryAtMs = now;
+    sendTelemetry(false);
+
+    // Pause the rover for 3 seconds on metal detection, then resume the mission.
+    if (allowMissionStop) {
+      stopMotors();
+      metalPauseUntilMs = now + 3000UL;
+      sendEvent("WARN", "METAL", "Metal detected on GPIO35; rover paused for 3 s then will resume mission");
+    }
+#if METAL_DETECTION_STOPS_MISSION
+    // Legacy flag: abort mission entirely instead of pausing.
+    if (allowMissionStop && !metalPauseUntilMs) {
+      missionAbortRequested = true;
+      stopMotors();
+      sendEvent("WARN", "METAL", "Metal detected; mission stopped because METAL_DETECTION_STOPS_MISSION=1");
     }
 #else
-    payload += String(",\"mag_cal_active\":false");
+    (void)allowMissionStop;
 #endif
-    // metal detector status
-    payload += String(",\"metal_detected\":") + (metalDetector.isMetalDetected() ? "true" : "false");
-    payload += String(",\"metal_freq_hz\":") + String(metalDetector.getCurrentFrequency(), 1);
-    payload += String(",\"metal_freq_dev_pct\":") + String(metalDetector.getFrequencyDeviation(), 1);
-    payload += String(",\"metal_confidence\":") + String(metalDetector.getConfidence());
-    payload += "}";
-    Serial.println(payload);
-    // log to SD if available
-#if USE_SD
-    sdLogger.logLine(payload);
-#endif
+  }
+
+  if (metalDetected != previousMetalDetected) {
+    StaticJsonDocument<160> doc;
+    doc["type"] = "event";
+    doc["level"] = metalDetected ? "WARN" : "INFO";
+    doc["category"] = "METAL";
+    doc["message"] = metalDetected ? "Metal detected: GPIO35 ADC is active-low" : "Metal cleared";
+    doc["adc"] = metalAdc;
+    writeJsonLine(doc);
+    lastTelemetryAtMs = now;
+    sendTelemetry(false);
+  }
 }
 
-void startAvoidance(float obstacleDistanceCm) {
-    avoidPhase = AVOID_BACKUP;
-    avoidPhaseStartMs = millis();
-    avoidTurnDir = ((millis() / 1000) % 2 == 0) ? 1 : -1;
-    sendEvent("WARN", "SENSOR", String("Obstacle detected at ") + String(obstacleDistanceCm, 1) + " cm. Starting avoidance.");
+void pollSerial(bool duringMotion);
+void pollCmdUdp(bool duringMotion);
+
+void maintainBackground(bool allowMissionStop) {
+  pollSerial(allowMissionStop);
+  pollCmdUdp(allowMissionStop);    // <-- add this line
+  sampleMetalDetector(allowMissionStop);
+  sampleDht11();
+
+  unsigned long now = millis();
+  if (now - lastTelemetryAtMs >= TELEMETRY_INTERVAL_MS) {
+    lastTelemetryAtMs = now;
+    bool detailedTelemetry = now - lastDetailedTelemetryAtMs >= TELEMETRY_DETAIL_INTERVAL_MS;
+    if (detailedTelemetry) {
+      lastDetailedTelemetryAtMs = now;
+    }
+    sendTelemetry(detailedTelemetry);
+  }
 }
 
-void runAvoidance() {
-    unsigned long elapsed = millis() - avoidPhaseStartMs;
-    if (avoidPhase == AVOID_BACKUP) {
-        if (elapsed < 700) {
-            drive.setSpeed(-120, -120);
-            return;
-        }
-        avoidPhase = AVOID_TURN;
-        avoidPhaseStartMs = millis();
-    }
-
-    if (avoidPhase == AVOID_TURN) {
-        unsigned long turnElapsed = millis() - avoidPhaseStartMs;
-        if (turnElapsed < 1000) {
-            if (avoidTurnDir > 0) drive.setSpeed(120, -120);
-            else drive.setSpeed(-120, 120);
-            return;
-        }
-        avoidPhase = AVOID_NONE;
-        sendEvent("INFO", "NAV", "Avoidance complete, resuming navigation");
-    }
+// Block execution (motors already stopped by sampleMetalDetector) until the
+// 3-second metal pause expires, keeping serial/telemetry alive during the wait.
+void waitForMetalPause() {
+  while (metalPauseUntilMs > 0 && millis() < metalPauseUntilMs && !missionAbortRequested && !estopLatched) {
+    maintainBackground(false);  // don't trigger another pause while waiting
+    delay(5);
+  }
+  if (metalPauseUntilMs > 0 && millis() >= metalPauseUntilMs) {
+    metalPauseUntilMs = 0;
+    sendEvent("INFO", "METAL", "Metal pause complete; resuming mission");
+  }
 }
 
-void handleDriveCommand(const String& line) {
-    int left = 0;
-    int right = 0;
-    int durationMs = 800;
-    extractIntField(line, "left", left);
-    extractIntField(line, "right", right);
-    extractIntField(line, "duration_ms", durationMs);
-#if MANUAL_FORCE_MAX_POWER
-    if (left != 0) left = left > 0 ? MANUAL_MAX_POWER : -MANUAL_MAX_POWER;
-    if (right != 0) right = right > 0 ? MANUAL_MAX_POWER : -MANUAL_MAX_POWER;
-#endif
-    left = constrain(left, -255, 255);
-    right = constrain(right, -255, 255);
-    drive.setSpeed(left, right);
-    currentMode = MODE_MANUAL;
-    manualUntilMs = millis() + (unsigned long)max(durationMs, 200);
+void timedMotorAction(int leftSpeed, int rightSpeed, unsigned long durationMs, bool allowMissionStop) {
+  waitForMetalPause();  // honour any active metal-detection pause before moving
+  if (missionAbortRequested || estopLatched) return;
+
+  unsigned long start = millis();
+  driveRaw(leftSpeed, rightSpeed);
+  while (!missionAbortRequested && !estopLatched && millis() - start < durationMs) {
+    maintainBackground(allowMissionStop);
+    if (metalPauseUntilMs > 0) {          // metal detected mid-move: freeze then resume
+      stopMotors();
+      waitForMetalPause();
+      if (missionAbortRequested || estopLatched) break;
+      driveRaw(leftSpeed, rightSpeed);    // restart motors after pause
+    }
+    delay(5);
+  }
+  stopMotors();
+  delay(LOCAL_PATH_STOP_AFTER_SEGMENT_MS);
 }
 
-void handleMissionStart(const String& line) {
-    float lat = 0.0f, lon = 0.0f;
-    float radiusCm = 100.0f;
-    float radiusM = -1.0f;
+void avoidObstacleManeuver(PointCm target) {
+  avoidingObstacle = true;
+  rememberedTarget = target;
+  rememberedTargetValid = true;
+  obstacleAvoidanceCount++;
 
-    bool hasLat = extractFloatField(line, "lat", lat);
-    bool hasLon = extractFloatField(line, "lon", lon);
-    bool hasRadiusCm = extractFloatField(line, "radius_cm", radiusCm);
-    bool hasRadiusM = extractFloatField(line, "radius_m", radiusM);
+  sendEvent("WARN", "OBSTACLE", String("Obstacle detected at ") + lastObstacleDistanceCm + "cm; detouring then resuming remembered target x=" + target.x + " y=" + target.y);
+  stopMotors();
 
-    if (!hasRadiusCm) {
-        float radiusRaw = 0.0f;
-        if (extractFloatField(line, "radius", radiusRaw)) {
-            // Dashboard sends radius in cm for bench testing.
-            radiusCm = radiusRaw;
-            hasRadiusCm = true;
-        }
+  float originalHeading = headingDeg;
+
+  timedMotorAction(-LOCAL_PATH_FORWARD_SPEED, -LOCAL_PATH_FORWARD_SPEED, OBSTACLE_BACKUP_MS, true);
+  updatePoseByDistance(-static_cast<float>(OBSTACLE_BACKUP_MS) / LOCAL_PATH_MS_PER_CM);
+
+  float turnDegrees = OBSTACLE_TURN_MS / LOCAL_PATH_MS_PER_DEG;
+  timedMotorAction(LOCAL_PATH_TURN_SPEED, -LOCAL_PATH_TURN_SPEED, OBSTACLE_TURN_MS, true);
+  headingDeg = wrap360(headingDeg - turnDegrees);
+
+  timedMotorAction(LOCAL_PATH_FORWARD_SPEED, LOCAL_PATH_FORWARD_SPEED, OBSTACLE_SIDESTEP_FORWARD_MS, true);
+  updatePoseByDistance(static_cast<float>(OBSTACLE_SIDESTEP_FORWARD_MS) / LOCAL_PATH_MS_PER_CM);
+
+  timedMotorAction(-LOCAL_PATH_TURN_SPEED, LOCAL_PATH_TURN_SPEED, OBSTACLE_TURN_MS, true);
+  headingDeg = originalHeading;
+
+  avoidingObstacle = false;
+  sendEvent("INFO", "PATH", String("Obstacle avoided. Remembered path target still x=") + target.x + " y=" + target.y + "; recalculating route.");
+}
+
+void turnToHeading(float targetHeadingDeg) {
+  targetHeadingDeg = wrap360(targetHeadingDeg);
+  float delta = normalizeDeltaDeg(targetHeadingDeg - headingDeg);
+  if (fabs(delta) < 3.0f) {
+    headingDeg = targetHeadingDeg;
+    return;
+  }
+
+  unsigned long durationMs = static_cast<unsigned long>(fabs(delta) * LOCAL_PATH_MS_PER_DEG);
+  if (delta > 0.0f) {
+    // Counter-clockwise / left turn.
+    timedMotorAction(-LOCAL_PATH_TURN_SPEED, LOCAL_PATH_TURN_SPEED, durationMs, true);
+  } else {
+    // Clockwise / right turn.
+    timedMotorAction(LOCAL_PATH_TURN_SPEED, -LOCAL_PATH_TURN_SPEED, durationMs, true);
+  }
+
+  if (!missionAbortRequested && !estopLatched) {
+    headingDeg = targetHeadingDeg;
+  }
+}
+
+bool driveForwardTo(PointCm target, float distanceCm) {
+  PointCm startPose = {poseXcm, poseYcm};
+  unsigned long durationMs = static_cast<unsigned long>(distanceCm * LOCAL_PATH_MS_PER_CM);
+  if (durationMs < 1) {
+    poseXcm = target.x;
+    poseYcm = target.y;
+    return true;
+  }
+
+  waitForMetalPause();  // honour any active metal-detection pause before moving
+  if (missionAbortRequested || estopLatched) return false;
+
+  unsigned long start = millis();
+  unsigned long lastObstacleCheck = 0;
+  driveRaw(LOCAL_PATH_FORWARD_SPEED, LOCAL_PATH_FORWARD_SPEED);
+
+  while (!missionAbortRequested && !estopLatched) {
+    unsigned long now = millis();
+    unsigned long elapsed = now - start;
+    float progress = min(1.0f, static_cast<float>(elapsed) / static_cast<float>(durationMs));
+    poseXcm = startPose.x + (target.x - startPose.x) * progress;
+    poseYcm = startPose.y + (target.y - startPose.y) * progress;
+
+    if (elapsed >= durationMs) {
+      break;
     }
 
-    if (!hasLat || !hasLon) {
-        sendEvent("ERROR", "MISSION", "Mission start rejected: lat/lon missing");
-        return;
+    maintainBackground(true);
+
+    if (metalPauseUntilMs > 0) {         // metal detected mid-forward-drive: freeze then resume
+      stopMotors();
+      waitForMetalPause();
+      if (missionAbortRequested || estopLatched) break;
+      start = millis() - elapsed;        // shift start so remaining time is preserved
+      driveRaw(LOCAL_PATH_FORWARD_SPEED, LOCAL_PATH_FORWARD_SPEED);
     }
 
-    targetLat = lat;
-    targetLon = lon;
-    targetRadiusM = hasRadiusM ? max(radiusM, 0.1f) : max(radiusCm / 100.0f, 0.1f);
+    if (now - lastObstacleCheck >= OBSTACLE_CHECK_INTERVAL_MS) {
+      lastObstacleCheck = now;
+      float distance = readDistanceCm();
+      if (distance > 0.0f && distance <= OBSTACLE_DISTANCE_CM) {
+        lastObstacleDistanceCm = distance;
+        avoidObstacleManeuver(target);
+        return false;
+      }
+    }
 
-    navigator.setGoal(targetLat, targetLon, targetRadiusM);
-    missionActive = true;
-    currentMode = MODE_AUTO;
-    avoidPhase = AVOID_NONE;
+    delay(5);
+  }
 
-    sendEvent("INFO", "MISSION", String("Mission accepted: target=") + String(targetLat, 6) + "," + String(targetLon, 6));
-    // try to forward mission over LoRa and require ACK
-    if (lora.begin(433E6)) {
-        bool queued = lora.sendReliable(line.c_str(), 4, 1500);
-        if (!queued) sendEvent("WARN", "LORA", "Mission forward failed to queue (pending full)");
-        else sendEvent("INFO", "LORA", "Mission queued for reliable LoRa forward (msg_id assigned)");
+  stopMotors();
+  delay(LOCAL_PATH_STOP_AFTER_SEGMENT_MS);
+
+  if (!missionAbortRequested && !estopLatched) {
+    poseXcm = target.x;
+    poseYcm = target.y;
+  }
+  return !missionAbortRequested && !estopLatched;
+}
+
+void driveToPoint(PointCm target) {
+  rememberedTarget = target;
+  rememberedTargetValid = true;
+  int avoidanceAttemptsForTarget = 0;
+
+  while (!missionAbortRequested && !estopLatched) {
+    float dx = target.x - poseXcm;
+    float dy = target.y - poseYcm;
+    float distanceCm = sqrtf(dx * dx + dy * dy);
+    if (distanceCm < 0.5f) {
+      poseXcm = target.x;
+      poseYcm = target.y;
+      return;
+    }
+
+    float targetHeading = wrap360(atan2f(dy, dx) * 180.0f / PI);
+    turnToHeading(targetHeading);
+    if (missionAbortRequested || estopLatched) {
+      return;
+    }
+
+    bool reached = driveForwardTo(target, distanceCm);
+    if (reached) {
+      return;
+    }
+
+    avoidanceAttemptsForTarget++;
+    if (avoidanceAttemptsForTarget >= OBSTACLE_MAX_AVOIDANCE_PER_TARGET) {
+      missionAbortRequested = true;
+      stopMotors();
+      sendEvent("ERROR", "OBSTACLE", String("Too many obstacles while trying to reach remembered target index ") + missionTargetIndex + "; mission aborted for safety.");
+      return;
+    }
+
+    sendEvent("INFO", "PATH", String("Resuming remembered path to target index ") + missionTargetIndex + " attempt " + (avoidanceAttemptsForTarget + 1));
+  }
+}
+
+void executeMission() {
+  // Copy pending points into the live mission buffer and clear the pending flag.
+  missionPointCount = pendingMissionPointCount;
+  for (int i = 0; i < missionPointCount; i++) {
+    missionPoints[i] = pendingMissionPoints[i];
+  }
+  pendingMission = false;
+  pendingMissionPointCount = 0;
+
+  missionAbortRequested = false;
+  missionActive = true;
+  robotMode = MODE_MISSION;
+  poseXcm = 0.0f;
+  poseYcm = 0.0f;
+  headingDeg = LOCAL_PATH_INITIAL_HEADING_DEG;
+  missionTargetIndex = -1;
+  rememberedTargetValid = false;
+  obstacleAvoidanceCount = 0;
+  lastObstacleDistanceCm = -1.0f;
+  avoidingObstacle = false;
+
+  sendEvent("INFO", "MISSION", String("Starting local path mission with ") + missionPointCount + " point(s)");
+
+  for (int i = 0; i < missionPointCount; i++) {
+    if (missionAbortRequested || estopLatched) {
+      break;
+    }
+    missionTargetIndex = i;
+    rememberedTarget = missionPoints[i];
+    rememberedTargetValid = true;
+    driveToPoint(missionPoints[i]);
+  }
+
+  stopMotors();
+  missionActive = false;
+  if (!estopLatched) {
+    robotMode = MODE_IDLE;
+  }
+
+  if (missionAbortRequested || estopLatched) {
+    sendEvent("WARN", "MISSION", "Mission aborted");
+  } else {
+    sendEvent("INFO", "MISSION", "Mission complete");
+  }
+  missionTargetIndex = -1;
+  sendTelemetry(true);
+}
+
+void handleCommand(JsonDocument& doc, bool duringMotion) {
+  const char* cmd = doc["cmd"] | "";
+
+  if (strcmp(cmd, "ping") == 0) {
+    StaticJsonDocument<128> reply;
+    reply["type"] = "event";
+    reply["level"] = "INFO";
+    reply["category"] = "LINK";
+    reply["message"] = "pong";
+    writeJsonLine(reply);
+    return;
+  }
+
+  if (strcmp(cmd, "status") == 0) {
+    sendTelemetry(true);
+    return;
+  }
+
+  if (strcmp(cmd, "test_metal_alert") == 0) {
+    metalAdc = analogRead(METAL_ADC_PIN);
+    metalAdcDrop = static_cast<int>(metalBaselineAdc - metalAdc);
+    sendEvent("INFO", "METAL", "Sending test metal alert at current rover position");
+    sendAlert(poseXcm, poseYcm);
+    return;
+  }
+
+  if (strcmp(cmd, "estop") == 0) {
+    estopLatched = true;
+    missionAbortRequested = true;
+    robotMode = MODE_ESTOP;
+    stopMotors();
+    sendEvent("ERROR", "SAFETY", "Emergency stop latched. Send reset_estop before moving again.");
+    return;
+  }
+
+  if (strcmp(cmd, "reset_estop") == 0) {
+    estopLatched = false;
+    missionAbortRequested = false;
+    robotMode = MODE_IDLE;
+    stopMotors();
+    sendEvent("INFO", "SAFETY", "Emergency stop reset");
+    return;
+  }
+
+  if (strcmp(cmd, "stop") == 0) {
+    missionAbortRequested = true;
+    manualStopAtMs = 0;
+    stopMotors();
+    if (!estopLatched) {
+      robotMode = MODE_IDLE;
+    }
+    sendEvent("WARN", "MOTOR", "Stop command received");
+    return;
+  }
+
+  if (estopLatched) {
+    sendEvent("WARN", "SAFETY", "Ignoring motion command while emergency stop is latched");
+    return;
+  }
+
+  if (duringMotion || missionActive) {
+    sendEvent("WARN", "BUSY", String("Ignoring command while mission is active: ") + cmd);
+    return;
+  }
+
+  if (strcmp(cmd, "wifi_config") == 0) {
+    const char* ssid = doc["ssid"] | "";
+    const char* password = doc["password"] | "";
+    const char* host = doc["host"] | "";
+    uint16_t port = doc["port"] | WIFI_ALERT_PORT;
+
+    if (strlen(ssid) == 0 || strlen(host) == 0 || port == 0) {
+      wifiAlertReady = false;
+      sendEvent("ERROR", "WIFI", "wifi_config requires ssid, host, and valid port");
+      return;
+    }
+
+    wifiAlertSsid = ssid;
+    wifiAlertHost = host;
+    wifiAlertPort = port;
+
+    WiFi.mode(WIFI_STA);
+    WiFi.disconnect(false, false);
+    delay(100);
+    WiFi.begin(ssid, password);
+
+    sendEvent("INFO", "WIFI", String("Connecting to SSID '") + ssid + "' for UDP alerts to " + wifiAlertHost + ":" + wifiAlertPort);
+    unsigned long start = millis();
+    while (WiFi.status() != WL_CONNECTED && millis() - start < 12000UL) {
+      delay(250);
+    }
+
+    if (WiFi.status() == WL_CONNECTED) {
+      wifiAlertReady = true;
+      sendEvent("INFO", "WIFI", String("WiFi UDP alerts ready. rover_ip=") + WiFi.localIP().toString() + " host=" + wifiAlertHost + ":" + wifiAlertPort);
     } else {
-        sendEvent("WARN", "LORA", "LoRa not initialized; mission not forwarded") ;
+      wifiAlertReady = false;
+      sendEvent("ERROR", "WIFI", "WiFi connection failed; metal alerts will continue over serial only");
     }
+    sendTelemetry(true);
+    return;
+  }
+
+  if (strcmp(cmd, "drive") == 0) {
+    int left = doc["left"] | 0;
+    int right = doc["right"] | 0;
+    unsigned long durationMs = doc["duration_ms"] | 0UL;
+    driveRaw(left, right);
+    robotMode = MODE_MANUAL;
+    manualStopAtMs = durationMs > 0 ? millis() + durationMs : 0;
+    sendEvent("INFO", "MOTOR", String("Drive left=") + left + " right=" + right + " duration_ms=" + durationMs);
+    return;
+  }
+
+  if (strcmp(cmd, "path") == 0) {
+    JsonArray points = doc["points"].as<JsonArray>();
+    int count = 0;
+    for (JsonVariant point : points) {
+      if (count >= LOCAL_PATH_MAX_POINTS) break;
+      pendingMissionPoints[count].x = point["x_cm"] | 0.0f;
+      pendingMissionPoints[count].y = point["y_cm"] | 0.0f;
+      count++;
+    }
+
+    if (count == 0) {
+      sendEvent("ERROR", "MISSION", "Path command did not include any points");
+      return;
+    }
+
+    // Queue the mission — loop() will call executeMission() on the next tick
+    // so we never block inside the UDP/serial receive path.
+    pendingMissionPointCount = count;
+    pendingMission = true;
+    sendEvent("INFO", "MISSION", String("Path queued with ") + count + " point(s); starting next loop tick");
+    return;
+  }
+
+  sendEvent("WARN", "SERIAL", String("Unknown command: ") + cmd);
 }
 
-void handleCommandLine(const String& line) {
-    if (line.length() == 0) return;
+void processSerialLine(String line, bool duringMotion) {
+  line.trim();
+  if (line.length() == 0) {
+    return;
+  }
 
-    if (line.indexOf("\"mission\":\"start\"") >= 0) {
-        handleMissionStart(line);
-        return;
-    }
+  // Path missions can carry many points. Keep this large parse buffer on the
+  // heap instead of the loopTask stack, because a path command immediately
+  // executes the mission before this function returns.
+  DynamicJsonDocument doc(4096);
+  DeserializationError err = deserializeJson(doc, line);
+  if (err) {
+    sendEvent("ERROR", "SERIAL", String("Invalid JSON: ") + err.c_str());
+    return;
+  }
 
-    if (line.indexOf("\"cmd\":\"drive\"") >= 0) {
-        if (currentMode != MODE_ESTOP) handleDriveCommand(line);
-        return;
-    }
-
-    if (line.indexOf("\"cmd\":\"stop\"") >= 0) {
-        drive.stop();
-        currentMode = missionActive ? MODE_AUTO : MODE_IDLE;
-        return;
-    }
-
-    if (line.indexOf("\"cmd\":\"estop\"") >= 0) {
-        drive.stop();
-        currentMode = MODE_ESTOP;
-        missionActive = false;
-        avoidPhase = AVOID_NONE;
-        sendEvent("WARN", "SAFETY", "Emergency stop latched");
-        return;
-    }
-
-    if (line.indexOf("\"cmd\":\"clear_estop\"") >= 0) {
-        if (currentMode == MODE_ESTOP) {
-            currentMode = MODE_IDLE;
-            sendEvent("INFO", "SAFETY", "Emergency stop cleared");
-        }
-        return;
-    }
-
-    if (line.indexOf("\"cmd\":\"ping\"") >= 0) {
-        Serial.println("{\"type\":\"ack\",\"message\":\"pong\"}");
-        return;
-    }
-
-    if (line.indexOf("\"cmd\":\"status\"") >= 0) {
-        sendTelemetryNow();
-        return;
-    }
-
-    // Magnetometer calibration commands (non-blocking)
-    if (line.indexOf("\"cmd\":\"calibrate_mag\"") >= 0) {
-        int dur = 15;
-        extractIntField(line, "duration_s", dur);
-        sendEvent("INFO", "CAL", String("Starting magnetometer calibration for ") + String(dur) + " s");
-    #if USE_IMU
-        imu.startMagCalibration((unsigned int)max(1, dur));
-    #else
-        sendEvent("WARN", "CAL", "IMU disabled: magnetometer calibration not available");
-    #endif
-        return;
-    }
-
-    if (line.indexOf("\"cmd\":\"calibrate_mag_stop\"") >= 0) {
-    #if USE_IMU
-        imu.stopMagCalibration();
-        sendEvent("INFO", "CAL", "Magnetometer calibration stopped by command");
-    #else
-        sendEvent("WARN", "CAL", "IMU disabled: no calibration to stop");
-    #endif
-        return;
-    }
+  handleCommand(doc, duringMotion);
 }
 
-void readSerialCommands() {
-    while (Serial.available()) {
-        char c = (char)Serial.read();
-        if (c == '\n') {
-            String line = serialLine;
-            serialLine = "";
-            line.trim();
-            if (line.length() > 0) handleCommandLine(line);
-        } else if (c != '\r') {
-            serialLine += c;
-            if (serialLine.length() > 400) serialLine = "";
-        }
+void pollSerial(bool duringMotion) {
+  while (Serial.available() > 0) {
+    char c = static_cast<char>(Serial.read());
+    if (c == '\n') {
+      processSerialLine(serialBuffer, duringMotion);
+      serialBuffer = "";
+    } else if (c != '\r') {
+      serialBuffer += c;
+      if (serialBuffer.length() > 3500) {
+        serialBuffer = "";
+        sendEvent("ERROR", "SERIAL", "Input line too long; buffer cleared");
+      }
     }
+  }
+}
+
+void calibrateMetalDetector() {
+  sendEvent("INFO", "METAL", String("Calibrating NE555 baseline. Active-low metal detection: GPIO35 ADC ") + METAL_ADC_DETECT_MIN + "-" + METAL_ADC_DETECT_MAX + " means metal; no metal is usually near 4095.");
+  unsigned long start = millis();
+  long sum = 0;
+  long count = 0;
+  while (millis() - start < METAL_CALIBRATION_MS) {
+    sum += analogRead(METAL_ADC_PIN);
+    count++;
+    delay(10);
+  }
+  metalBaselineAdc = count > 0 ? sum / count : analogRead(METAL_ADC_PIN);
+  metalAdc = metalBaselineAdc;
+  metalAdcMin = metalAdc;
+  metalAdcMax = metalAdc;
+  metalAdcDrop = 0;
+  metalDetected = false;
+  previousMetalDetected = false;
+  sendEvent("INFO", "METAL", String("Calibration complete. baseline_adc=") + metalBaselineAdc + "; detect_range=" + METAL_ADC_DETECT_MIN + "-" + METAL_ADC_DETECT_MAX);
+}
+
+void setupWifiAlerts() {
+#if WIFI_ALERT_ENABLED
+  wifiAlertSsid = WIFI_ALERT_SSID;
+  wifiAlertHost = WIFI_ALERT_HOST;
+  wifiAlertPort = WIFI_ALERT_PORT;
+  WiFi.mode(WIFI_STA);
+  WiFi.begin(WIFI_ALERT_SSID, WIFI_ALERT_PASSWORD);
+  unsigned long start = millis();
+  while (WiFi.status() != WL_CONNECTED && millis() - start < 6000UL) {
+    delay(250);
+  }
+
+  if (WiFi.status() == WL_CONNECTED) {
+    wifiAlertReady = true;
+    sendEvent("INFO", "WIFI", String("WiFi UDP alerts ready. ip=") + WiFi.localIP().toString());
+  } else {
+    wifiAlertReady = false;
+    sendEvent("WARN", "WIFI", "WiFi alert connection failed; continuing with serial alerts only");
+  }
+#else
+  wifiAlertReady = false;
+  sendEvent("INFO", "WIFI", "WiFi UDP alerts waiting for dashboard wifi_config command");
+#endif
+}
+
+void setupCmdUdp() {
+  if (WiFi.status() != WL_CONNECTED) return;
+  if (cmdUdp.begin(WIFI_CMD_PORT)) {
+    cmdUdpReady = true;
+    sendEvent("INFO", "WIFI", String("UDP command listener ready on port ") + WIFI_CMD_PORT);
+  } else {
+    sendEvent("ERROR", "WIFI", "Failed to start UDP command listener");
+  }
+}
+
+void pollCmdUdp(bool duringMotion) {
+  if (!cmdUdpReady) return;
+  int packetSize = cmdUdp.parsePacket();
+  if (packetSize <= 0) return;
+
+  char buf[3500];
+  int len = cmdUdp.read(buf, sizeof(buf) - 1);
+  if (len <= 0) return;
+  buf[len] = '\0';
+
+  // Store sender so we can reply if needed
+  // cmdUdp.remoteIP(), cmdUdp.remotePort()
+
+  String line = String(buf);
+  line.trim();
+  if (line.length() > 0) {
+    processSerialLine(line, duringMotion);  // reuse exact same JSON handler
+  }
 }
 
 void setup() {
-    Serial.begin(BAUD_RATE);
-    delay(200);
-    Serial.println("Rover mission controller booting...");
+  pinMode(MOTOR_IN1_PIN, OUTPUT);
+  pinMode(MOTOR_IN2_PIN, OUTPUT);
+  pinMode(MOTOR_IN3_PIN, OUTPUT);
+  pinMode(MOTOR_IN4_PIN, OUTPUT);
+  stopMotors();
 
-    drive.begin();
-    gps.begin(9600);
-    navigator.begin();
-    frontUltrasonic.init();
+  pinMode(ULTRASONIC_TRIG_PIN, OUTPUT);
+  pinMode(ULTRASONIC_ECHO_PIN, INPUT);
+  dht.begin();
 
-#if USE_IMU
-    imuReady = imu.begin();
-    if (imuReady) sendEvent("INFO", "IMU", "IMU fusion initialized");
-    else sendEvent("WARN", "IMU", "IMU init failed, heading fallback enabled");
-#else
-    imuReady = false;
-    sendEvent("INFO", "IMU", "IMU disabled at compile time; heading fallback enabled");
-#endif
+  analogReadResolution(12);
+  analogSetPinAttenuation(METAL_ADC_PIN, ADC_11db);
+  analogSetPinAttenuation(MQ2_ADC_PIN, ADC_11db);
 
-    // initialize SD logger
-#if USE_SD
-    if (sdLogger.begin()) sendEvent("INFO", "SD", "SD logger ready");
-    else sendEvent("WARN", "SD", "SD logger not available");
-#else
-    sendEvent("INFO", "SD", "SD logger disabled in config");
-#endif
+  Serial.begin(SERIAL_BAUD);
+  delay(500);
 
-    // initialize LoRa (optional)
-    if (lora.begin(433E6)) sendEvent("INFO", "LORA", "LoRa initialized");
-    else sendEvent("WARN", "LORA", "LoRa init failed or not present");
+  sendEvent("INFO", "BOOT", "Mine Detection Rover firmware started");
+  sendEvent("INFO", "MOTOR", String("L298N pins IN1=") + MOTOR_IN1_PIN + " IN2=" + MOTOR_IN2_PIN + " IN3=" + MOTOR_IN3_PIN + " IN4=" + MOTOR_IN4_PIN);
+  sendEvent("INFO", "DHT11", String("DHT11 data pin GPIO") + DHT11_DATA_PIN);
 
-    // initialize metal detector NE555
-    metalDetector.begin();
-    sendEvent("INFO", "METAL", "Starting metal detector calibration (3 sec, keep away from metal)...");
-    if (metalDetector.calibrate()) {
-        sendEvent("INFO", "METAL", String("Metal detector calibrated. Baseline: ") + String(metalDetector.getBaselineFrequency(), 1) + " Hz");
-    } else {
-        sendEvent("WARN", "METAL", "Metal detector calibration failed");
-    }
-
-    sendEvent("INFO", "SYSTEM", "Mission controller ready");
+  calibrateMetalDetector();
+  setupWifiAlerts();
+  setupCmdUdp();   // start UDP command listener on WIFI_CMD_PORT (4211)
+  sendTelemetry(true);
 }
 
 void loop() {
-    static unsigned long lastMicros = micros();
-    unsigned long nowMicros = micros();
-    float dt = (nowMicros - lastMicros) / 1000000.0f;
-    if (dt <= 0.0f) dt = 0.02f;
-    lastMicros = nowMicros;
+  pollSerial(false);
+  pollCmdUdp(false);
+  sampleMetalDetector(false);
+  sampleDht11();
 
-    readSerialCommands();
+  if (robotMode == MODE_MANUAL && manualStopAtMs > 0 && millis() >= manualStopAtMs) {
+    stopMotors();
+    manualStopAtMs = 0;
+    robotMode = MODE_IDLE;
+    sendEvent("INFO", "MOTOR", "Timed manual drive complete");
+  }
 
-    String loraLine;
-    while (lora.readMessage(loraLine)) {
-        loraLine.trim();
-        if (loraLine.length() > 0) handleCommandLine(loraLine);
+  // Start any queued mission now that we are back at the top of loop(),
+  // completely outside the UDP/serial receive path. This guarantees the
+  // blocking executeMission() call starts with a clean stack and the UDP
+  // socket in a known idle state.
+  if (pendingMission && !missionActive && !estopLatched) {
+    executeMission();
+  }
+
+  unsigned long now = millis();
+  if (now - lastTelemetryAtMs >= TELEMETRY_INTERVAL_MS) {
+    lastTelemetryAtMs = now;
+    bool detailedTelemetry = now - lastDetailedTelemetryAtMs >= TELEMETRY_DETAIL_INTERVAL_MS;
+    if (detailedTelemetry) {
+      lastDetailedTelemetryAtMs = now;
     }
+    sendTelemetry(detailedTelemetry);
+  }
 
-    gps.feed();
-    lastGps = gps.getData();
-
-#if USE_IMU
-    if (imuReady) {
-        imu.update();
-        lastHeadingDeg = imu.getHeading();
-    } else {
-        // Heading fallback: use GPS course when moving above threshold
-        float fallbackKph = HEADING_FALLBACK_SPEED_THRESHOLD_MPS * 3.6f;
-        if (lastGps.valid && lastGps.speedKph > fallbackKph && !isnan(lastGps.courseDeg)) {
-            lastHeadingDeg = lastGps.courseDeg;
-        }
-    }
-#else
-    // Heading fallback: use GPS course when moving above threshold
-    float fallbackKph = HEADING_FALLBACK_SPEED_THRESHOLD_MPS * 3.6f;
-    if (lastGps.valid && lastGps.speedKph > fallbackKph && !isnan(lastGps.courseDeg)) {
-        lastHeadingDeg = lastGps.courseDeg;
-    }
-#endif
-
-    // update metal detector frequency measurement
-    metalDetector.update();
-    
-    // handle metal detection state change
-    bool metalNow = metalDetector.isMetalDetected();
-    if (metalNow && !metalDetectedPrevious) {
-        // Metal just detected!
-        sendEvent("WARN", "METAL", String("*** METAL DETECTED *** Freq dev: ") + String(metalDetector.getFrequencyDeviation(), 1) + "% Confidence: " + String(metalDetector.getConfidence()) + "%");
-        drive.stop(); // emergency stop
-        currentMode = MODE_IDLE;
-        missionActive = false;
-        // alert via LoRa if available and GPS lock present
-        if (lastGps.valid) {
-            String alert = String("{\"type\":\"alert\",\"alert_type\":\"metal_detected\",\"lat\":") + String(lastGps.latitude, 6)
-                         + String(",\"lon\":") + String(lastGps.longitude, 6)
-                         + String(",\"freq_hz\":") + String(metalDetector.getCurrentFrequency(), 1)
-                         + String(",\"confidence\":") + String(metalDetector.getConfidence())
-                         + String("}");
-            bool queued = lora.sendReliable(alert.c_str(), 4, 1500);
-            if (queued) sendEvent("INFO", "LORA", "Metal alert queued for LoRa transmission");
-        }
-    }
-    metalDetectedPrevious = metalNow;
-
-    if (millis() - lastObstacleCheckMs >= OBSTACLE_CHECK_INTERVAL_MS) {
-        lastObstacleCheckMs = millis();
-        lastDistanceCm = frontUltrasonic.getDistance();
-    }
-
-    if (currentMode == MODE_ESTOP) {
-        drive.stop();
-    } else if (currentMode == MODE_MANUAL) {
-        if (millis() > manualUntilMs) {
-            drive.stop();
-            currentMode = missionActive ? MODE_AUTO : MODE_IDLE;
-        }
-    } else if (missionActive && currentMode == MODE_AUTO) {
-        if (avoidPhase != AVOID_NONE) {
-            runAvoidance();
-        } else if (lastDistanceCm > 0 && lastDistanceCm < OBSTACLE_THRESHOLD_CM) {
-            startAvoidance(lastDistanceCm);
-            runAvoidance();
-        } else if (lastGps.valid) {
-            bool arrived = navigator.update(lastGps, lastHeadingDeg, dt);
-            if (arrived) {
-                missionActive = false;
-                currentMode = MODE_IDLE;
-                drive.stop();
-                sendEvent("INFO", "MISSION", "Target reached");
-            }
-        } else {
-            // Hold if GPS fix is unavailable while in auto mode
-            drive.stop();
-        }
-    } else {
-        drive.stop();
-    }
-
-    // poll LoRa for incoming messages and reliable-send retries
-    lora.poll();
-
-    if (millis() - lastTelemetryMs >= TELEMETRY_INTERVAL_MS) {
-        lastTelemetryMs = millis();
-        sendTelemetryNow();
-    }
-
-    delay(10);
+  delay(5);
 }

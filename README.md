@@ -1,84 +1,141 @@
-# Mine Detection Rover - Underground Detection System
+# Mine Detection Rover
 
-## Overview
-This project is an ESP32-based rover platform for underground mine detection, obstacle handling, telemetry, and future laptop control.
+ESP32-based mine-detection rover controlled from a Streamlit laptop dashboard over USB serial. This scaffold follows `BUILD_GUIDE.md` and defaults to ESP32 port **COM7** at **115200 baud**.
 
-## Components / Bill of Materials
-Below is a comprehensive list of components used by this project (suggested quantities shown):
+## Project layout
 
-- **Microcontroller:** ESP32 DOIT DevKit V1 (ESP32-WROOM-32) — 1
-- **LoRa module:** SX1278 (433 MHz) with antenna and header — 1
-- **GPS module:** NEO-6M UART GPS module — 1
-- **IMU:** MPU9250 (Accel + Gyro + AK8963 magnetometer) or MPU6050 + HMC5883L combo — 1
-- **Motor drivers:** BTS7960 H-bridge driver modules — 2
-- **DC motors:** 12V DC geared motors (matched pair) — 2
-- **Chassis & drivetrain:** 2WD rover chassis, wheels, mounting hardware — 1 kit
-- **Ultrasonic sensors:** HC-SR04 distance sensors — 2
-- **Metal detector module:** NE555 astable oscillator module + search coil (4-pin: GND, VCC, Coil1, Coil2) — 1 module + coil
-	- 100 Ω series resistor for output to ESP32 input recommended
-	- Shielding / ferrite beads recommended to reduce motor noise coupling
-- **Gas/smoke sensor:** MQ-2 sensor module (with amplifier) — 1
-- **Environmental sensor (optional):** DHT11 or DHT22 — 1
-- **MicroSD logging:** microSD card module (SPI) + microSD card (Class 10, 8–32GB) — 1
-- **Power supply:** 12V battery pack (Li-ion pack or SLA) with appropriate capacity — 1
-- **Power protection:** inline fuse, emergency stop switch — 1 each
-- **Power regulation:** Buck converters (12V → 5V and 12V → 3.3V) — as required (2)
-- **Battery & current sensing (optional but recommended):** voltage divider or INA219 / ACS712 current sensor — 1
-- **Connectors & wiring:** screw terminals, bullet connectors, AWG 14–20 power wires, Dupont jumper wires — assorted
-- **Level shifting / logic interfaces:** bidirectional level shifter or proper wiring for 3.3V/5V modules — as needed
-- **Passive components:** pull-up/pull-down resistors, decoupling capacitors, 100nF and electrolytic caps — assorted
-- **Indicators & controls:** LEDs, momentary buttons, emergency-stop latching switch — assorted
-- **Mechanical hardware:** screws, standoffs, spacers, zip ties, mounting brackets — assorted
-- **Tools & accessories:** USB A→micro/Type-C cable, soldering iron + solder, multimeter, wire stripper, heat shrink tubing — assorted
-- **Optional modules / improvements:** antenna tuning components, metal detector coil preamp, RF shielding, custom PCB, enclosure
-
-Note: many hobby modules (NEO-6M, SX1278, MQ-2, HC-SR04) are 5V-tolerant or require 5V power; ensure signal levels are safe for the ESP32 (3.3V) or use level shifters. See `docs/METAL_DETECTOR_NE555.md` for specific wiring of the NE555 metal detector and coil guidance.
-
-## Wiring Snapshot
-- Ultrasonic Trigger: GPIO 5
-- Ultrasonic Echo: GPIO 18
-- DHT11 Data: GPIO 4
-- E-STOP: configured in `config.h`
-- Motor PWM and direction pins: configured in `config.h`
-- LoRa, GPS, MQ-2, metal detector, and battery monitor pins: configured in `config.h`
-
-## Build And Upload
-1. Install the PlatformIO extension in VS Code.
-2. Connect the ESP32 through USB.
-3. Run `pio run` to build.
-4. Run `pio run -t upload` to flash the board.
-5. Open Serial Monitor at 115200 baud for telemetry.
-
-## Laptop Dashboard
-The control station lives in `dashboard/app.py` and uses Streamlit.
-
-Run it with:
-
-```bash
-f:/Electronics_Lab/.venv/Scripts/python.exe -m streamlit run dashboard/app.py
+```text
+.
+├── platformio.ini              # ESP32 PlatformIO build/upload config, COM7 default
+├── include/config.h            # Pin map, tuning constants, WiFi UDP settings
+├── src/main.cpp                # Active rover firmware
+├── src/gps.cpp                 # Historical placeholder, excluded from build
+├── src/loramodule.cpp          # Historical placeholder, excluded from build
+├── src/navigator.cpp           # Historical placeholder, excluded from build
+├── dashboard/app.py            # Streamlit serial/mission dashboard
+├── dashboard/requirements.txt  # Python dashboard dependencies
+├── scripts/run_dashboard.ps1   # Installs dashboard deps and runs Streamlit
+└── scripts/upload_firmware_COM7.ps1
 ```
 
-The dashboard supports live telemetry, manual drive control, map-based target selection, mission upload, and emergency stop commands.
+## Prerequisites
 
-The selected mission is sent as a JSON packet like:
+1. Install VS Code extensions recommended by this workspace:
+   - PlatformIO IDE
+   - Python
+2. Connect the ESP32 by USB and confirm it appears as `COM7`.
+3. Close the dashboard or serial monitor before uploading firmware; only one program can own `COM7` at a time.
+
+## Build and upload firmware
+
+From a terminal in this folder:
+
+```powershell
+.\.venv\Scripts\python.exe -m pip install --upgrade platformio
+.\.venv\Scripts\python.exe -m platformio run
+.\.venv\Scripts\python.exe -m platformio run -t upload --upload-port COM7
+```
+
+Or run:
+
+```powershell
+.\scripts\upload_firmware_COM7.ps1
+```
+
+The PlatformIO config already contains:
+
+```ini
+upload_port = COM7
+monitor_port = COM7
+monitor_speed = 115200
+```
+
+## Run dashboard
+
+```powershell
+python -m pip install -r dashboard/requirements.txt
+python -m streamlit run dashboard/app.py
+```
+
+If you are using the workspace virtual environment directly:
+
+```powershell
+.\.venv\Scripts\python.exe -m pip install -r dashboard/requirements.txt
+.\.venv\Scripts\python.exe -m streamlit run dashboard/app.py
+```
+
+Or run:
+
+```powershell
+.\scripts\run_dashboard.ps1
+```
+
+Then open the dashboard, keep the default serial port `COM7`, baud `115200`, and click **Connect**.
+
+## First hardware test
+
+1. Wire ESP32, L298N, motors, motor battery, and common ground.
+2. Upload firmware.
+3. Start the dashboard and connect to `COM7`.
+4. Open **Control**.
+5. Set base speed to `140` or higher.
+6. Click **Forward**.
+7. Use **Stop Motors** or **Emergency Stop** if needed.
+
+## Tuning
+
+Edit `include/config.h` after real floor tests:
+
+- `LOCAL_PATH_MS_PER_CM`: increase if the rover drives too short; decrease if it drives too far.
+- `LOCAL_PATH_MS_PER_DEG`: increase if turns undershoot; decrease if turns overshoot.
+- `METAL_ADC_DETECT_MIN` / `METAL_ADC_DETECT_MAX`: GPIO35 active-low metal detection range. Current default is `0`-`100` ADC; no metal is usually near `4095`.
+- `OBSTACLE_DISTANCE_CM`: ultrasonic avoidance trigger distance.
+
+## Sensor telemetry
+
+Fast telemetry is split into two packet types:
+
+- Compact telemetry every ~150 ms for fast values like `metal_adc`, `metal_detected`, rover pose, and heading.
+- Detailed telemetry every ~1 second for slower fields like DHT11, WiFi status, distance, and mission metadata.
+
+The dashboard merges compact and detailed packets, so fast metal ADC changes update quickly without losing slower fields.
+
+The rover now publishes these additional telemetry fields:
+
+- `metal_adc`, `metal_adc_min`, `metal_adc_max`, `metal_adc_detect_min`, `metal_adc_detect_max` — current GPIO35 active-low metal detector values. `metal_adc_min` captures short ADC drops between dashboard refreshes.
+- `dht11_ok`, `dht11_temperature_c`, `dht11_humidity_percent` — DHT11 readings from GPIO15.
+- `mission_target_index`, `remembered_target_valid`, `obstacle_count`, `last_obstacle_cm`, `avoiding_obstacle` — path memory and obstacle avoidance state.
+
+During a mission, the ultrasonic obstacle routine remembers the current path target, performs a backup/right-sidestep detour, then recalculates toward the remembered target and continues the original mission path.
+
+The dashboard has **Auto update every 1s** available, but it is off by default to keep control and mission buttons stable. Enable it only while monitoring telemetry, then turn it off before sending path missions.
+
+## WiFi UDP alerts
+
+Serial alerts work by default. For WiFi UDP metal alerts, use the dashboard runtime configuration:
+
+1. Start the dashboard and connect to `COM7`.
+2. In the sidebar, click **Start UDP** on port `4210`.
+3. Expand **Configure rover WiFi UDP alerts**.
+4. Enter the WiFi SSID/password and the dashboard computer IP.
+5. Click **Send WiFi Config**.
+6. Click **Test Metal Alert** to confirm the dashboard receives an alert and adds a red dot.
+
+The dashboard sends this command to the rover:
 
 ```json
-{"mission":"start","lat":23.8103,"lon":90.4125,"radius":20}
+{"cmd":"wifi_config","ssid":"your_wifi_name","password":"your_wifi_password","host":"192.168.0.199","port":4210}
 ```
 
-The rover firmware still needs the mission receiver / navigation loop to act on that packet if you want fully autonomous travel to the selected location.
+You can also compile WiFi credentials into firmware if desired:
 
-## Process
-1. Power the rover through the fused 12V line and buck converters.
-2. Verify sensor readings on Serial before enabling motor motion.
-3. Test manual control and emergency stop.
-4. Validate obstacle avoidance and heading correction.
-5. Move to waypoint, spiral search, and event logging phases.
+1. Set `WIFI_ALERT_ENABLED` to `1` in `include/config.h`.
+2. Set `WIFI_ALERT_SSID`, `WIFI_ALERT_PASSWORD`, and `WIFI_ALERT_HOST`.
+3. Upload firmware again.
+4. In the dashboard sidebar, click **Start UDP** on port `4210`.
 
-## Data Collected
-- Distance measurements
-- Temperature and humidity
-- Battery status
-- GPS position and heading
-- LoRa telemetry packets
-- Metal-detect and smoke events
+## Notes
+
+- GPS and LoRa are intentionally excluded from the current build.
+- L298N ENA/ENB are expected to be jumpered HIGH, so firmware treats speed values as direction/on thresholds instead of PWM speed control.
+- The rover starts local path missions at `(0, 0)` with initial heading toward positive Y.
