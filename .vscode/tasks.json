@@ -10,18 +10,18 @@
       "problemMatcher": ["$gcc"]
     },
     {
-      "label": "PlatformIO: Upload to ESP32 COM7",
+      "label": "PlatformIO: Upload to ESP32 COM8",
       "type": "shell",
       "command": "${workspaceFolder}\\.venv\\Scripts\\python.exe",
-      "args": ["-m", "platformio", "run", "-t", "upload", "--upload-port", "COM7"],
+      "args": ["-m", "platformio", "run", "-t", "upload", "--upload-port", "COM8"],
       "group": "build",
       "problemMatcher": ["$gcc"]
     },
     {
-      "label": "PlatformIO: Serial monitor COM7",
+      "label": "PlatformIO: Serial monitor COM8",
       "type": "shell",
       "command": "${workspaceFolder}\\.venv\\Scripts\\python.exe",
-      "args": ["-m", "platformio", "device", "monitor", "-p", "COM7", "-b", "115200"],
+      "args": ["-m", "platformio", "device", "monitor", "-p", "COM8", "-b", "115200"],
       "isBackground": true,
       "problemMatcher": []
     },

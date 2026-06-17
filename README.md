@@ -1,12 +1,12 @@
 # Mine Detection Rover
 
-ESP32-based mine-detection rover controlled from a Streamlit laptop dashboard over USB serial. This scaffold follows `BUILD_GUIDE.md` and defaults to ESP32 port **COM7** at **115200 baud**.
+ESP32-based mine-detection rover controlled from a Streamlit laptop dashboard over USB serial. This scaffold follows `BUILD_GUIDE.md` and defaults to ESP32 port **COM8** at **115200 baud**.
 
 ## Project layout
 
 ```text
 .
-├── platformio.ini              # ESP32 PlatformIO build/upload config, COM7 default
+├── platformio.ini              # ESP32 PlatformIO build/upload config, COM8 default
 ├── include/config.h            # Pin map, tuning constants, WiFi UDP settings
 ├── src/main.cpp                # Active rover firmware
 ├── src/gps.cpp                 # Historical placeholder, excluded from build
@@ -15,7 +15,7 @@ ESP32-based mine-detection rover controlled from a Streamlit laptop dashboard ov
 ├── dashboard/app.py            # Streamlit serial/mission dashboard
 ├── dashboard/requirements.txt  # Python dashboard dependencies
 ├── scripts/run_dashboard.ps1   # Installs dashboard deps and runs Streamlit
-└── scripts/upload_firmware_COM7.ps1
+└── scripts/upload_firmware_COM8.ps1
 ```
 
 ## Prerequisites
@@ -23,8 +23,8 @@ ESP32-based mine-detection rover controlled from a Streamlit laptop dashboard ov
 1. Install VS Code extensions recommended by this workspace:
    - PlatformIO IDE
    - Python
-2. Connect the ESP32 by USB and confirm it appears as `COM7`.
-3. Close the dashboard or serial monitor before uploading firmware; only one program can own `COM7` at a time.
+2. Connect the ESP32 by USB and confirm it appears as `COM8`.
+3. Close the dashboard or serial monitor before uploading firmware; only one program can own `COM8` at a time.
 
 ## Build and upload firmware
 
@@ -33,20 +33,20 @@ From a terminal in this folder:
 ```powershell
 .\.venv\Scripts\python.exe -m pip install --upgrade platformio
 .\.venv\Scripts\python.exe -m platformio run
-.\.venv\Scripts\python.exe -m platformio run -t upload --upload-port COM7
+.\.venv\Scripts\python.exe -m platformio run -t upload --upload-port COM8
 ```
 
 Or run:
 
 ```powershell
-.\scripts\upload_firmware_COM7.ps1
+.\scripts\upload_firmware_COM8.ps1
 ```
 
 The PlatformIO config already contains:
 
 ```ini
-upload_port = COM7
-monitor_port = COM7
+upload_port = COM8
+monitor_port = COM8
 monitor_speed = 115200
 ```
 
@@ -70,13 +70,13 @@ Or run:
 .\scripts\run_dashboard.ps1
 ```
 
-Then open the dashboard, keep the default serial port `COM7`, baud `115200`, and click **Connect**.
+Then open the dashboard, keep the default serial port `COM8`, baud `115200`, and click **Connect**.
 
 ## First hardware test
 
 1. Wire ESP32, L298N, motors, motor battery, and common ground.
 2. Upload firmware.
-3. Start the dashboard and connect to `COM7`.
+3. Start the dashboard and connect to `COM8`.
 4. Open **Control**.
 5. Set base speed to `140` or higher.
 6. Click **Forward**.
@@ -114,7 +114,7 @@ The dashboard has **Auto update every 1s** available, but it is off by default t
 
 Serial alerts work by default. For WiFi UDP metal alerts, use the dashboard runtime configuration:
 
-1. Start the dashboard and connect to `COM7`.
+1. Start the dashboard and connect to `COM8`.
 2. In the sidebar, click **Start UDP** on port `4210`.
 3. Expand **Configure rover WiFi UDP alerts**.
 4. Enter the WiFi SSID/password and the dashboard computer IP.

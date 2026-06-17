@@ -78,7 +78,7 @@ GPIO 35 and GPIO 36 are input-only pins on ESP32. That is fine for ADC/input use
 
 In the dashboard sidebar:
 
-- Select `COM7` or the ESP32 serial port shown on your PC.
+- Select `COM8` or the ESP32 serial port shown on your PC.
 - Select baud rate `115200`.
 - Click `Connect`.
 
@@ -244,7 +244,7 @@ Rover to dashboard:
 
 ### Upload fails
 
-- Disconnect the dashboard from COM7.
+- Disconnect the dashboard from COM8.
 - Close serial monitors.
 - Unplug and reconnect the ESP32 USB cable.
 - Hold BOOT during upload if the board does not enter flashing mode automatically.

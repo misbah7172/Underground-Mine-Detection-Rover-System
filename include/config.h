@@ -5,11 +5,13 @@
 // Serial dashboard link
 #define SERIAL_BAUD 115200
 
-// L298N motor driver input pins. ENA/ENB are expected to be jumpered HIGH.
+// L298N motor driver input pins.
 #define MOTOR_IN1_PIN 26
 #define MOTOR_IN2_PIN 27
 #define MOTOR_IN3_PIN 14
 #define MOTOR_IN4_PIN 12
+#define MOTOR_ENA_PIN 18
+#define MOTOR_ENB_PIN 19
 
 // Sensors
 #define ULTRASONIC_TRIG_PIN 33
@@ -53,9 +55,9 @@
 #define TELEMETRY_DETAIL_INTERVAL_MS 1000UL
 
 // Optional WiFi UDP alerts. Leave disabled until serial control works.
-#define WIFI_ALERT_SSID "vivoY21"
-#define WIFI_ALERT_PASSWORD "154089@UIU"
-#define WIFI_ALERT_HOST "172.30.204.254"
+#define WIFI_ALERT_SSID "UIU-STUDENT"
+#define WIFI_ALERT_PASSWORD "12345678"
+#define WIFI_ALERT_HOST "10.15.13.89"
 #define WIFI_ALERT_ENABLED    1
 #define WIFI_ALERT_PORT       4210               // dashboard listens here
 

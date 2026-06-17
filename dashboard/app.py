@@ -25,7 +25,7 @@ except Exception:  # pragma: no cover - optional UI component
 
 Point = Dict[str, float]
 
-DEFAULT_PORT = "COM7"
+DEFAULT_PORT = "COM8"
 DEFAULT_BAUD = 115200
 DEFAULT_UDP_PORT = 4210
 MAX_LOG_LINES = 350

@@ -37,12 +37,6 @@ float poseXcm = 0.0f;
 float poseYcm = 0.0f;
 float headingDeg = LOCAL_PATH_INITIAL_HEADING_DEG;
 
-// Pending mission: path command received over UDP/serial is queued here and
-// started from loop() so executeMission() never blocks inside the receive path.
-bool pendingMission = false;
-PointCm pendingMissionPoints[LOCAL_PATH_MAX_POINTS];
-int pendingMissionPointCount = 0;
-
 String serialBuffer;
 unsigned long manualStopAtMs = 0;
 unsigned long lastTelemetryAtMs = 0;
@@ -115,24 +109,18 @@ void stopMotors() {
   digitalWrite(MOTOR_IN2_PIN, LOW);
   digitalWrite(MOTOR_IN3_PIN, LOW);
   digitalWrite(MOTOR_IN4_PIN, LOW);
-  analogWrite(MOTOR_ENA_PIN, 0);
-  analogWrite(MOTOR_ENB_PIN, 0);
 }
 
-void setMotorChannel(int speed, int pinA, int pinB, int pinEN) {
-  int absSpeed = constrain(abs(speed), 0, 255);
+void setMotorChannel(int speed, int pinA, int pinB) {
   if (speed > 10) {
     digitalWrite(pinA, HIGH);
     digitalWrite(pinB, LOW);
-    analogWrite(pinEN, absSpeed);
   } else if (speed < -10) {
     digitalWrite(pinA, LOW);
     digitalWrite(pinB, HIGH);
-    analogWrite(pinEN, absSpeed);
   } else {
     digitalWrite(pinA, LOW);
     digitalWrite(pinB, LOW);
-    analogWrite(pinEN, 0);
   }
 }
 
@@ -142,8 +130,9 @@ void driveRaw(int leftSpeed, int rightSpeed) {
     return;
   }
 
-  setMotorChannel(leftSpeed, MOTOR_IN1_PIN, MOTOR_IN2_PIN, MOTOR_ENA_PIN);
-  setMotorChannel(rightSpeed, MOTOR_IN3_PIN, MOTOR_IN4_PIN, MOTOR_ENB_PIN);
+  // ENA/ENB are jumpered HIGH, so speed magnitude is treated as an on/off threshold.
+  setMotorChannel(leftSpeed, MOTOR_IN1_PIN, MOTOR_IN2_PIN);
+  setMotorChannel(rightSpeed, MOTOR_IN3_PIN, MOTOR_IN4_PIN);
 }
 
 void updatePoseByDistance(float distanceCm) {
@@ -242,17 +231,7 @@ void sendTelemetry(bool detailed = false) {
       doc["wifi_ssid"] = wifiAlertSsid;
     }
   }
-  char telPayload[1024];
-  size_t telLen = serializeJson(doc, telPayload, sizeof(telPayload));
-  Serial.println(telPayload);
-
-  // Also broadcast telemetry over UDP so the dashboard receives it wirelessly.
-  if (wifiAlertReady) {
-    udp.beginPacket(wifiAlertHost.c_str(), wifiAlertPort);
-    udp.write(reinterpret_cast<const uint8_t*>(telPayload), telLen);
-    udp.endPacket();
-  }
-
+  writeJsonLine(doc);
   metalAdcMin = metalAdc;
   metalAdcMax = metalAdc;
 }
@@ -329,7 +308,6 @@ void sampleMetalDetector(bool allowMissionStop) {
 
 void pollSerial(bool duringMotion);
 void pollCmdUdp(bool duringMotion);
-void setupCmdUdp();
 
 void maintainBackground(bool allowMissionStop) {
   pollSerial(allowMissionStop);
@@ -366,15 +344,13 @@ void timedMotorAction(int leftSpeed, int rightSpeed, unsigned long durationMs, b
   if (missionAbortRequested || estopLatched) return;
 
   unsigned long start = millis();
-  unsigned long elapsed = 0;
   driveRaw(leftSpeed, rightSpeed);
-  while (!missionAbortRequested && !estopLatched && (elapsed = millis() - start) < durationMs) {
+  while (!missionAbortRequested && !estopLatched && millis() - start < durationMs) {
     maintainBackground(allowMissionStop);
     if (metalPauseUntilMs > 0) {          // metal detected mid-move: freeze then resume
       stopMotors();
       waitForMetalPause();
       if (missionAbortRequested || estopLatched) break;
-      start = millis() - elapsed;        // shift start so remaining time is preserved
       driveRaw(leftSpeed, rightSpeed);    // restart motors after pause
     }
     delay(5);
@@ -395,16 +371,13 @@ void avoidObstacleManeuver(PointCm target) {
   float originalHeading = headingDeg;
 
   timedMotorAction(-LOCAL_PATH_FORWARD_SPEED, -LOCAL_PATH_FORWARD_SPEED, OBSTACLE_BACKUP_MS, true);
-  if (missionAbortRequested || estopLatched) { avoidingObstacle = false; return; }
   updatePoseByDistance(-static_cast<float>(OBSTACLE_BACKUP_MS) / LOCAL_PATH_MS_PER_CM);
 
   float turnDegrees = OBSTACLE_TURN_MS / LOCAL_PATH_MS_PER_DEG;
   timedMotorAction(LOCAL_PATH_TURN_SPEED, -LOCAL_PATH_TURN_SPEED, OBSTACLE_TURN_MS, true);
-  if (missionAbortRequested || estopLatched) { avoidingObstacle = false; return; }
   headingDeg = wrap360(headingDeg - turnDegrees);
 
   timedMotorAction(LOCAL_PATH_FORWARD_SPEED, LOCAL_PATH_FORWARD_SPEED, OBSTACLE_SIDESTEP_FORWARD_MS, true);
-  if (missionAbortRequested || estopLatched) { avoidingObstacle = false; return; }
   updatePoseByDistance(static_cast<float>(OBSTACLE_SIDESTEP_FORWARD_MS) / LOCAL_PATH_MS_PER_CM);
 
   timedMotorAction(-LOCAL_PATH_TURN_SPEED, LOCAL_PATH_TURN_SPEED, OBSTACLE_TURN_MS, true);
@@ -535,14 +508,6 @@ void driveToPoint(PointCm target) {
 }
 
 void executeMission() {
-  // Copy pending points into the live mission buffer and clear the pending flag.
-  missionPointCount = pendingMissionPointCount;
-  for (int i = 0; i < missionPointCount; i++) {
-    missionPoints[i] = pendingMissionPoints[i];
-  }
-  pendingMission = false;
-  pendingMissionPointCount = 0;
-
   missionAbortRequested = false;
   missionActive = true;
   robotMode = MODE_MISSION;
@@ -676,9 +641,6 @@ void handleCommand(JsonDocument& doc, bool duringMotion) {
 
     if (WiFi.status() == WL_CONNECTED) {
       wifiAlertReady = true;
-      if (!cmdUdpReady) {
-        setupCmdUdp();
-      }
       sendEvent("INFO", "WIFI", String("WiFi UDP alerts ready. rover_ip=") + WiFi.localIP().toString() + " host=" + wifiAlertHost + ":" + wifiAlertPort);
     } else {
       wifiAlertReady = false;
@@ -701,24 +663,22 @@ void handleCommand(JsonDocument& doc, bool duringMotion) {
 
   if (strcmp(cmd, "path") == 0) {
     JsonArray points = doc["points"].as<JsonArray>();
-    int count = 0;
+    missionPointCount = 0;
     for (JsonVariant point : points) {
-      if (count >= LOCAL_PATH_MAX_POINTS) break;
-      pendingMissionPoints[count].x = point["x_cm"] | 0.0f;
-      pendingMissionPoints[count].y = point["y_cm"] | 0.0f;
-      count++;
+      if (missionPointCount >= LOCAL_PATH_MAX_POINTS) {
+        break;
+      }
+      missionPoints[missionPointCount].x = point["x_cm"] | 0.0f;
+      missionPoints[missionPointCount].y = point["y_cm"] | 0.0f;
+      missionPointCount++;
     }
 
-    if (count == 0) {
+    if (missionPointCount == 0) {
       sendEvent("ERROR", "MISSION", "Path command did not include any points");
       return;
     }
 
-    // Queue the mission — loop() will call executeMission() on the next tick
-    // so we never block inside the UDP/serial receive path.
-    pendingMissionPointCount = count;
-    pendingMission = true;
-    sendEvent("INFO", "MISSION", String("Path queued with ") + count + " point(s); starting next loop tick");
+    executeMission();
     return;
   }
 
@@ -820,7 +780,7 @@ void pollCmdUdp(bool duringMotion) {
   int packetSize = cmdUdp.parsePacket();
   if (packetSize <= 0) return;
 
-  static char buf[3501];
+  char buf[3500];
   int len = cmdUdp.read(buf, sizeof(buf) - 1);
   if (len <= 0) return;
   buf[len] = '\0';
@@ -840,8 +800,6 @@ void setup() {
   pinMode(MOTOR_IN2_PIN, OUTPUT);
   pinMode(MOTOR_IN3_PIN, OUTPUT);
   pinMode(MOTOR_IN4_PIN, OUTPUT);
-  pinMode(MOTOR_ENA_PIN, OUTPUT);
-  pinMode(MOTOR_ENB_PIN, OUTPUT);
   stopMotors();
 
   pinMode(ULTRASONIC_TRIG_PIN, OUTPUT);
@@ -861,13 +819,12 @@ void setup() {
 
   calibrateMetalDetector();
   setupWifiAlerts();
-  setupCmdUdp();   // start UDP command listener on WIFI_CMD_PORT (4211)
   sendTelemetry(true);
 }
 
 void loop() {
   pollSerial(false);
-  pollCmdUdp(false);
+  pollCmdUdp(false); 
   sampleMetalDetector(false);
   sampleDht11();
 
@@ -876,14 +833,6 @@ void loop() {
     manualStopAtMs = 0;
     robotMode = MODE_IDLE;
     sendEvent("INFO", "MOTOR", "Timed manual drive complete");
-  }
-
-  // Start any queued mission now that we are back at the top of loop(),
-  // completely outside the UDP/serial receive path. This guarantees the
-  // blocking executeMission() call starts with a clean stack and the UDP
-  // socket in a known idle state.
-  if (pendingMission && !missionActive && !estopLatched) {
-    executeMission();
   }
 
   unsigned long now = millis();

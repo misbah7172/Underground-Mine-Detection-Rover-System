@@ -16,5 +16,5 @@ if ($LASTEXITCODE -ne 0) {
 	if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 }
 
-& $Python -m platformio run -t upload --upload-port COM7
+& $Python -m platformio run -t upload --upload-port COM8
 exit $LASTEXITCODE
